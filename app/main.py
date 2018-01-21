@@ -8,15 +8,25 @@ import requests
 import monkey
 import util
 from config import config
-from lian_jia import City, District, BizCircle, Community
+from lian_jia import City, District, BizCircle, Community, House
 from util.orm import Session
 
 # 行政区名称 id 映射, 如: 海淀 -> 23008618
 DISTRICT_MAP = {}
 
 
+def get_house():
+    db_session = Session()
+    communities = db_session.query(Community).filter(
+        Community.second_hand_quantity != 0
+    ).all()
+    for community in communities:
+        get_house_by_community(community)
+
+
 def main():
     city_id = config.city_id
+    #get_house()
     update_city(city_id)
     update_communities(city_id)
 
@@ -32,7 +42,6 @@ def update_city(city_id):
 
     db_session = Session()
     db_session.merge(city)
-
     for district_info in city_info['district']:
         district = District(city.id, district_info)
         logging.info('城市={}, 区域={}, 商圈数={}'.format(city.name, district.name, district.biz_circles_count))
@@ -43,12 +52,14 @@ def update_city(city_id):
             biz_circle = db_session.query(BizCircle).filter(
                 BizCircle.id == int(biz_circle_info['bizcircle_id'])
             ).first()
-
             if biz_circle:
                 # 记录已存在，可能需要更新 district_id
+                #
                 if district.id not in biz_circle.district_id:
                     # biz_circle.district_id.append()、district_id += 等方式都不能更新表
-                    biz_circle.district_id = biz_circle.district_id + [district.id]
+                    dist_list = list(biz_circle.district_id)
+                    dist_list.append(district.id)
+                    biz_circle.district_id = tuple(dist_list)
             else:
                 biz_circle = BizCircle(city.id, district.id, biz_circle_info)
                 db_session.add(biz_circle)
@@ -73,7 +84,6 @@ def get_city_info(city_id):
     data = util.get_data(url, payload, method='POST')
 
     city_info = data['city_info']['info'][0]
-
     for a_city in data['city_config_all']['list']:
         if a_city['city_id'] == city_id:
             # 查找城市名称缩写
@@ -81,7 +91,7 @@ def get_city_info(city_id):
             break
 
     else:
-        logging.error(f'# 抱歉, 链家网暂未收录该城市~')
+        logging.error('# 抱歉, 链家网暂未收录该城市~')
         sys.exit(1)
 
     return city_info
@@ -167,12 +177,13 @@ def update_db(db_session, biz_circle, communities):
     db_session.query(Community).filter(
         Community.biz_circle_id == biz_circle.id
     ).delete()
-
+    community_objs = []
     for community_info in communities['list']:
         try:
             district_id = DISTRICT_MAP[community_info['district_name']]
             community = Community(biz_circle.city_id, district_id, biz_circle.id, community_info)
             db_session.add(community)
+            community_objs.append(community)
         except Exception as e:
             # 返回的信息可能是错误的/不完整的, 如小区信息失效后返回的是不完整的信息
             # 如: http://sz.lianjia.com/xiaoqu/2414168277659446
@@ -182,6 +193,10 @@ def update_db(db_session, biz_circle, communities):
     biz_circle.communities_updated_at = datetime.now()
 
     db_session.commit()
+
+    # 得到小区的房源信息
+    for community in community_objs:
+        get_house_by_community(community)
 
 
 def proxy_patch():
@@ -199,6 +214,83 @@ def proxy_patch():
 
     requests.Session = XSession
     warnings.simplefilter('ignore', InsecureRequestWarning)
+
+
+def get_house_by_community(community):
+    """
+    按小区获得房子信息
+    """
+    url = 'http://app.api.lianjia.com/house/ershoufang/searchv4'
+    offset = 0
+
+    houses = {
+        'count': 0,
+        'list': []
+    }
+
+    while True:
+        params = {
+            "comunityIdRequest": "c" + str(community.id),
+            "city_id": community.city_id,
+            "limit_offset": offset,
+            "condition": "c" + str(community.id),
+            "queryStringText": community.name,
+            "limit_count": 20,
+        }
+        print(params)
+        data = util.get_data(url, params)
+        if data['total_count'] == 0:
+            # 没有数据, 小区房源数不准确
+            break
+
+        if data:
+            houses['count'] = data['total_count']
+            house_count = 0
+            if 'list' not in data:
+                logging.warn("get houses list failed: %s"%data)
+                break
+            for house in data['list']:
+                ### 还有一些不是房子的数据
+                if 'house_code' in house:
+                    house_count += 1
+                    houses['list'].append(house)
+
+            if data['has_more_data']:
+                offset += house_count
+            else:
+                break
+        else:
+            # 存在没有数据的时候, 如: http://bj.lianjia.com/xiaoqu/huairouqita1/
+            break
+
+    # 去重, 有时链家服务器抽风(或者本身数据就是错误的)... 返回的数据有重复的, 需要处理下
+    # 如: http://sh.lianjia.com/xiaoqu/hengshanlu/
+    d = {house['house_code']: house for house in houses['list']}
+    houses['list'] = d.values()
+    update_houses_db(community, houses)
+
+
+def update_houses_db(community, houses):
+    """
+    更新小区信息, 商圈信息
+    """
+    db_session = Session()
+    db_session.query(House).filter(
+        House.commonity_id == community.id
+    ).delete()
+
+    for house_info in houses['list']:
+        try:
+            house = House(community.city_id, community.district_id, community.biz_circle_id, community.id, house_info)
+            db_session.add(house)
+        except Exception as e:
+            # 返回的信息可能是错误的/不完整的, 如小区信息失效后返回的是不完整的信息
+            # 如: http://sz.lianjia.com/xiaoqu/2414168277659446
+            logging.error('错误: 二手房 id: {}; 错误信息: {}'.format(house_info['house_code'], repr(e)))
+
+    db_session.commit()
+    db_session.close()
+    return houses
 
 
 if __name__ == '__main__':

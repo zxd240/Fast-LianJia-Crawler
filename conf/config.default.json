@@ -1,8 +1,8 @@
 {
   "db_info": {
-    "db": "lian-jia",
+    "db": "lianjia",
     "host": "127.0.0.1",
-    "user": "postgres",
-    "password": "password"
+    "user": "root",
+    "password": "123456"
   }
 }

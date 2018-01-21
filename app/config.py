@@ -16,10 +16,10 @@ class Config:
         self.log_format = log_format
 
         self.db_info = {
-            'db': '',
-            'host': '',
-            'user': '',
-            'password': ''
+            'db': 'lian-jia',
+            'host': '127.0.0.1',
+            'user': 'root',
+            'password': '5432'
         }
 
         self.lian_jia = {
